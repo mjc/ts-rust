@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::ast::store::{
-    file_store_file_name, file_store_parser_flags, publish_file_stores, unpublished_file_ids,
+    file_store_file_name, file_store_slot_count, publish_file_stores, unpublished_file_ids,
 };
 use crate::diagnostics::Message;
 use crate::frontend::bundled;
@@ -515,7 +515,7 @@ fn go_files_of_unpublished_stores(
         let root = file.map_or(Node::NIL, |file| file.root);
         files.push(GoFile {
             root,
-            parser_flags: file_store_parser_flags(store),
+            node_count: file_store_slot_count(store),
             info,
             node_bind: OnceLock::new(),
             file_bind: OnceLock::new(),

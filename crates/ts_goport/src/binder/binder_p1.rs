@@ -65,10 +65,10 @@ pub struct Binder {
 
     /// Rust-only: `Node::file_index` of `file`.
     pub file_index: usize,
-    /// Rust-only: parser flags of `file` (`GoFile::parser_flags`), indexed
+    /// Rust-only: parser flags of `file`, indexed
     /// by `NodeId::index()`. Cached so `node_flags` skips the program lookup.
     /// The guard pins a freeable file version while the binder runs.
-    pub parser_flags: FileRef<[NodeFlags]>,
+    pub parser_flags: crate::ast::ParserFlags,
     /// Rust-only: binder data per node of `file`, indexed by `NodeId::index()`.
     pub node_bind: NodeBindBuilder,
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
@@ -348,8 +348,7 @@ pub fn bind_source_file_detached(file: Node, symbols: &mut SymbolArena) -> Bound
 /// The snapshot generator and its test use it for the live side.
 pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile {
     let file_index = file.file_index();
-    let parser_flags =
-        crate::ast::file_version::go_file_ref!(file_index, 0, |g, _key| g.parser_flags[..]);
+    let parser_flags = crate::ast::file_store_parser_flags(file_index);
     let node_count = parser_flags.len();
     // PERF: U1 (e). A store file has counts from its slot kinds, made when
     // it was frozen, so the flow nodes grow with no copy. Its entry count
@@ -567,7 +566,7 @@ impl Binder {
     pub fn node_flags(&self, node: Node) -> NodeFlags {
         debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
         let index = node.node_id().index();
-        self.parser_flags[index] | self.node_bind.get(index).added_flags
+        self.parser_flags.get(index) | self.node_bind.get(index).added_flags
     }
 
     /// Go `node.AsBinaryExpression()` of BinaryExpression `node` of `file`,

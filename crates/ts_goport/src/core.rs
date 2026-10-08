@@ -4364,9 +4364,8 @@ pub(crate) fn go_panic_text(f: impl FnOnce()) -> String {
 pub struct GoFile {
     /// The `SourceFile` node. Its nodes live in a node store (`ast::store`).
     pub root: Node,
-    /// Go `node.Flags` from the parser for each node, indexed by
-    /// `NodeId::index()`. It includes the Go parser context flags.
-    pub parser_flags: Vec<NodeFlags>,
+    /// Number of node-store slots, including nil and alias slots.
+    pub node_count: usize,
     /// Go `ast.SourceFile` fields that the parser and program set.
     pub info: crate::program::SourceFileInfo,
     /// The binder fields of the nodes that are not in their node records

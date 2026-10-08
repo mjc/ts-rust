@@ -140,7 +140,7 @@ pub(crate) use crate::frontend::bundled::{const_hash, mix};
 struct SnapshotKey {
     /// `SOURCES_HASH` of the build that wrote the section.
     sources: u64,
-    /// The slot count (`GoFile::parser_flags` length).
+    /// The node-store slot count.
     nodes: u32,
     /// xxh3 of the file text.
     text: u64,
@@ -157,7 +157,7 @@ impl SnapshotKey {
         let go_file = crate::ast::go_file(file.file_index());
         Some(SnapshotKey {
             sources: SOURCES_HASH,
-            nodes: u32::try_from(go_file.parser_flags.len()).ok()?,
+            nodes: u32::try_from(go_file.node_count).ok()?,
             text: text_hash(file),
             text_const: const_hash(source_file_text(file).as_bytes()),
             parse: parse_hash(file, &go_file)?,
@@ -189,7 +189,7 @@ impl SnapshotKey {
         if self.sources != SOURCES_HASH {
             return Err("sources");
         }
-        if self.nodes as usize != go_file.parser_flags.len() {
+        if self.nodes as usize != go_file.node_count {
             return Err("nodes");
         }
         if !text_matches(self.text, self.text_const, &source_file_text(file)) {
@@ -249,7 +249,11 @@ fn parse_hash(file: Node, go_file: &GoFile) -> Option<u64> {
     const FLUSH: usize = 16 * 1024;
     let mut buffer: Vec<u8> = Vec::with_capacity(FLUSH + 64);
     let base = (file_index as u64) << 32;
-    for (index, flags) in go_file.parser_flags.iter().enumerate().skip(1) {
+    for (index, flags) in crate::ast::file_store_parser_flags(file_index)
+        .iter()
+        .enumerate()
+        .skip(1)
+    {
         let node = Node(base | (index as u64 + 1));
         let kind = node.kind();
         if kind == SyntaxKind::Unknown {

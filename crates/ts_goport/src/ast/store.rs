@@ -190,9 +190,6 @@ struct FileStore {
     /// Slot of the SourceFile node that `mark_source_file_roots` found when
     /// the file was frozen, or 0 (the nil slot).
     root_slot: u32,
-    /// `file_store_parser_flags`, made on the parsing thread when the file
-    /// is frozen. The loader takes it once.
-    parser_flags: Option<Vec<NodeFlags>>,
     /// Go `file.jsdocCache`, set by `finishSourceFile`. Node reads use it
     /// until the file is published (its `GoFile` holds it then), so
     /// `publish_file_stores` empties it.
@@ -3699,22 +3696,18 @@ impl FileStore {
     /// `freeze_file_store` for this store, which has id `file`.
     fn freeze(&mut self, file: usize) {
         self.end_parse();
-        // One pass over the records for the parser flags and the facts.
-        let mut flags = Vec::with_capacity(self.records.len());
-        self.make_facts(|r| flags.push(r.flags()));
-        self.parser_flags = Some(flags);
+        self.make_facts();
     }
 
     /// Makes `facts` and the U1 (e) `bind_estimate` in one pass over the
-    /// slots, and calls `each` on every slot record. Then moves the R2-5
+    /// slots. Then moves the R2-5
     /// build vector into `links` and drops `identifier_names`.
     // PERF: no pass over the node data. Debug builds check the records and
     // kids against the node data (`debug_check_kids`).
-    fn make_facts(&mut self, mut each: impl FnMut(&NodeRecord)) {
+    fn make_facts(&mut self) {
         let mut facts = StoreFacts::ONLY_NIL_SLOT;
         let mut counts = BindCounts::default();
         for (i, (record, &kind)) in self.records.iter().zip(&self.kinds).enumerate() {
-            each(record);
             counts.add(kind);
             if i != NIL_SLOT as usize {
                 facts.add(record, kind);
@@ -3835,7 +3828,6 @@ impl FileStore {
         self.jsdoc_cache = FxHashMap::default();
         self.lazy_js_doc = None;
         self.lazy_jsdoc_cache = FxHashMap::default();
-        self.parser_flags = None;
         // lsshells M3c: the `GoFile` holds the JSDoc cache and the
         // diagnostics of the file from now on.
         if let Some(owned) = self.owned.as_deref_mut() {
@@ -3846,7 +3838,7 @@ impl FileStore {
             self.root = handle(file, self.root_slot);
         }
         if !self.facts_made {
-            self.make_facts(|_| {});
+            self.make_facts();
         }
     }
 
@@ -3919,7 +3911,7 @@ pub fn is_file_store_frozen(file: usize) -> bool {
 }
 
 /// Number of slots (nil, alias and node slots). Per-node vectors that are
-/// indexed by `NodeId::index()` (`GoFile::parser_flags`) need this length.
+/// indexed by `NodeId::index()` need this length.
 #[must_use]
 pub fn file_store_slot_count(file: usize) -> usize {
     // A freeable file version keeps its records in its node shell.
@@ -3928,21 +3920,56 @@ pub fn file_store_slot_count(file: usize) -> usize {
         .unwrap_or_else(|| with_store(file, |s| s.records.len()))
 }
 
-/// The parser `node.Flags` of every slot, indexed by slot index. Nil and
-/// alias slots give no flags. The loader fills `GoFile::parser_flags` from
-/// this for the binder, before the publish.
-#[must_use]
-pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
-    // AST node records, step 2: the records of a published file also hold
-    // the flags that the binder added, so its parser flags are the ones
-    // that its `GoFile` took before the publish.
-    if let Some(flags) = try_with_go_file(file, |g| g.parser_flags.clone()) {
-        return flags;
+/// A pinned view of the parser flags in published node records. Binder
+/// additions are masked out; no second per-node flags column is retained.
+#[derive(Clone, Default)]
+pub struct ParserFlags {
+    records: FileRef<[NodeRecord]>,
+}
+
+impl ParserFlags {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.records.len()
     }
-    let computed = |s: &FileStore| s.records.iter().map(NodeRecord::flags).collect();
-    with_store_mut(file, |s| {
-        s.parser_flags.take().unwrap_or_else(|| computed(s))
-    })
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> NodeFlags {
+        self.records[index].flags() & super::PARSER_ONLY_FLAGS
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeFlags> + '_ {
+        self.records
+            .iter()
+            .map(|r| r.flags() & super::PARSER_ONLY_FLAGS)
+    }
+}
+
+/// Parser flags of a published file. Permanent files borrow their static
+/// records; a freeable version pins its pooled records for the view's life.
+#[must_use]
+pub fn file_store_parser_flags(file: usize) -> ParserFlags {
+    let block = file_block(file).expect("parser flags need a published file");
+    let records = if block.file.store.is_some() {
+        FileRef::Static(block.records)
+    } else {
+        FileRef::Pinned {
+            version: published_version(file).expect("a published file version"),
+            key: 0,
+            get: |version, _| {
+                let published = version
+                    .published()
+                    .expect("a pinned file version is published");
+                &published.block.records[..published.go_file.node_count]
+            },
+        }
+    };
+    ParserFlags { records }
 }
 
 /// Publishes the build stores of this thread: `go_files[i]` is the
@@ -5815,7 +5842,6 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 local(s.root),
                 s.aliases.len(),
             ),
-            format!("parser_flags {:?}", s.parser_flags),
             format!("jsdoc {jsdoc:?}"),
             format!(
                 "lazy {:?} lazy_cache {}",
@@ -7432,6 +7458,53 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn published_parser_flags_preserve_parse_errors_and_exclude_bind_flags() {
+        let file = new_file_store("/parserflags/static.ts", "x;");
+        let x = NodeFactory::for_file(file).new_identifier("x");
+        let original = NodeFlags::AMBIENT | NodeFlags::THIS_NODE_HAS_ERROR;
+        set_store_node_flags(x, original);
+        freeze_file_store(file);
+        crate::program::publish_parsed_files("/");
+        let flags = file_store_parser_flags(file);
+        let index = slot_index(x);
+        assert_eq!(flags.len(), file_store_slot_count(file));
+        assert_eq!(flags.get(index), original);
+        let before: Vec<_> = flags.iter().collect();
+        let data = NodeBindData {
+            added_flags: NodeFlags::CONTAINS_THIS | NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR,
+            ..NodeBindData::default()
+        };
+        bind_store_records(
+            file,
+            std::iter::once((index, 0, Some(&data), FlowNodeId::NIL)),
+        );
+        assert!(x.flags().contains(data.added_flags));
+        assert_eq!(flags.get(index), original);
+        assert_eq!(flags.iter().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn parser_flags_view_pins_freeable_node_records() {
+        use super::super::file_version::{FileVersion, release_file_version_pins};
+        let file = new_file_store("/parserflags/version.ts", "x;");
+        let x = NodeFactory::for_file(file).new_identifier("x");
+        set_store_node_flags(x, NodeFlags::AMBIENT);
+        freeze_file_store(file);
+        let version = FileVersion::new(file);
+        let weak = Arc::downgrade(&version);
+        crate::program::publish_parsed_files("/");
+        let flags = file_store_parser_flags(file);
+        drop(version);
+        release_file_version_pins();
+        assert!(weak.upgrade().is_some(), "the flags view pins its version");
+        assert_eq!(flags.get(slot_index(x)), NodeFlags::AMBIENT);
+        assert_eq!(flags.len(), 2);
+        drop(flags);
+        release_file_version_pins();
+        assert!(weak.upgrade().is_none(), "the flags view releases its pin");
     }
 
     // astmem1 P3: the bind ORs its added flags into the `flags` word of a

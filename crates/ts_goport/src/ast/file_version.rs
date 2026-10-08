@@ -162,11 +162,11 @@ impl FileVersion {
         self.published.get()
     }
 
-    /// The node count of the version (its parser flags), 0 before the
+    /// The node count of the version, 0 before the
     /// publish.
     fn node_count(&self) -> usize {
         self.published()
-            .map_or(0, |store| store.go_file().parser_flags.len())
+            .map_or(0, |store| store.go_file().node_count)
     }
 
     /// Takes the data out of a version that dies (`PinRelease`): its store
