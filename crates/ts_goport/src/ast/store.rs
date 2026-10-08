@@ -5657,7 +5657,7 @@ impl FileStore {
             text_is_keyword,
         } = slot;
         let node = match data {
-            Some(data) => leak_in_ast_arena(data),
+            Some(data) => shared_empty_node(&data).unwrap_or_else(|| leak_in_ast_arena(data)),
             None => shared_name_node(kind),
         };
         // The `ParentCode` of a parent in this store (nil for `NIL_SLOT`).
@@ -5918,6 +5918,41 @@ fn shared_name_node(kind: SyntaxKind) -> &'static NodeData {
     }
 }
 
+/// Empty payloads carry no node identity: kind, flags, location and parent
+/// live in the slot columns. Share their immutable data, as for name nodes,
+/// instead of retaining an arena entry for each token or keyword type.
+/// A data write still replaces only its slot (`replace_store_node_data`).
+#[inline]
+fn shared_empty_node(data: &NodeData) -> Option<&'static NodeData> {
+    macro_rules! shared {
+        ($variant:ident, $payload:ident, $value:expr) => {{
+            // Adding a payload field must force a new sharing audit.
+            let crate::astdata::$payload = **$value;
+            static DATA: OnceLock<NodeData> = OnceLock::new();
+            Some(DATA.get_or_init(|| NodeData::$variant(Box::new(crate::astdata::$payload))))
+        }};
+    }
+    match data {
+        NodeData::Token(value) => shared!(Token, TokenData, value),
+        NodeData::KeywordTypeNode(value) => shared!(KeywordTypeNode, KeywordTypeNodeData, value),
+        NodeData::ThisTypeNode(value) => shared!(ThisTypeNode, ThisTypeNodeData, value),
+        NodeData::NotEmittedTypeElement(value) => {
+            shared!(NotEmittedTypeElement, NotEmittedTypeElementData, value)
+        }
+        NodeData::OmittedExpression(value) => {
+            shared!(OmittedExpression, OmittedExpressionData, value)
+        }
+        NodeData::JsxOpeningFragment(value) => {
+            shared!(JsxOpeningFragment, JsxOpeningFragmentData, value)
+        }
+        NodeData::JsxClosingFragment(value) => {
+            shared!(JsxClosingFragment, JsxClosingFragmentData, value)
+        }
+        NodeData::JsDocAllType(value) => shared!(JsDocAllType, JsDocAllTypeData, value),
+        _ => None,
+    }
+}
+
 /// S1, debug builds: panics unless `data` (the payload the factory builds
 /// for a store name node of kind `kind`) equals the data of the shared node
 /// of `kind`. The struct patterns name every field, so a new astdata field
@@ -5987,6 +6022,9 @@ fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<
     );
     if FREEABLE_PARSE.get() {
         return alloc_store_owned_slot(file, kind, data, text);
+    }
+    if let Some(shared) = shared_empty_node(&data) {
+        return alloc_store_slot_node(file, kind, shared, text);
     }
     alloc_store_slot_node(file, kind, leak_in_ast_arena(data), text)
 }
@@ -6772,6 +6810,77 @@ mod tests {
         let big = entry.with_typed(Some((SlotChildren::TYPED_TYPE, 1 << 28)), false);
         assert_eq!(big.typed_parts().0, SlotChildren::TYPED_UNKNOWN);
         assert_eq!(std::mem::size_of::<SlotChildren>(), 12);
+    }
+
+    #[test]
+    fn stateless_store_payloads_share_data_but_not_headers() {
+        fn nodes(f: &NodeFactory) -> [Node; 8] {
+            [
+                f.new_token(SyntaxKind::QuestionToken),
+                f.new_keyword_type_node(SyntaxKind::NumberKeyword),
+                f.new_this_type_node(),
+                f.new_not_emitted_type_element(),
+                f.new_omitted_expression(),
+                f.new_jsx_opening_fragment(),
+                f.new_jsx_closing_fragment(),
+                f.new_js_doc_all_type(),
+            ]
+        }
+        let file = new_file_store("/stateless.ts", "");
+        let f = NodeFactory::for_file(file);
+        let first = nodes(&f);
+        let second = nodes(&f);
+        for (&a, &b) in first.iter().zip(&second) {
+            assert_ne!(a, b);
+            assert_eq!(a.kind(), b.kind());
+            assert!(std::ptr::eq(store_ast_node(a), store_ast_node(b)));
+            set_store_node_loc(a, TextRange::new(1, 2));
+            set_store_node_parent(a, first[0]);
+            assert_ne!(a.loc(), b.loc());
+            assert_eq!(b.parent(), Node::NIL);
+        }
+        // A write replaces only its slot, as for shared name data.
+        replace_store_node_data(first[0], store_ast_node(first[0]).clone());
+        assert!(!std::ptr::eq(
+            store_ast_node(first[0]),
+            store_ast_node(second[0])
+        ));
+        freeze_file_store(file);
+        for (&a, &b) in first.iter().zip(&second) {
+            assert_eq!(a.kind(), b.kind());
+            assert_ne!(a.loc(), b.loc());
+        }
+    }
+
+    #[test]
+    fn stateless_snapshot_payloads_share_data() {
+        let file = new_file_store("/stateless-snapshot.ts", "");
+        let f = NodeFactory::for_file(file);
+        for _ in 0..2 {
+            f.new_token(SyntaxKind::QuestionToken);
+            f.new_keyword_type_node(SyntaxKind::NumberKeyword);
+        }
+        freeze_file_store(file);
+        let views = lib_parse_slot_views(file).unwrap();
+        let loaded = new_file_store("/loaded-stateless.ts", "");
+        let mut slots = views.iter().map(|v| LibParseSlot {
+            kind: v.kind,
+            flags: v.flags,
+            loc: v.loc,
+            parent: v.parent,
+            first_child: v.first_child,
+            next_sibling: v.next_sibling,
+            data: Some(v.data.clone()),
+            name: v.name.clone(),
+            text_is_keyword: v.text_is_keyword,
+        });
+        assert!(load_lib_parse_slots(loaded, views.len(), || slots.next()));
+        freeze_file_store(loaded);
+        let hydrated = lib_parse_slot_views(loaded).unwrap();
+        for (a, b) in [(0, 2), (1, 3)] {
+            assert!(std::ptr::eq(hydrated[a].data, hydrated[b].data));
+            assert!(std::ptr::eq(hydrated[a].data, views[a].data));
+        }
     }
 
     #[test]
