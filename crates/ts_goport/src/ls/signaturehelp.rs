@@ -814,7 +814,7 @@ impl LanguageService {
             Some(emit_context.clone()),
         );
 
-        let type_parameters: Vec<TypeId> = if c.sig(candidate_signature).target.is_some() {
+        let type_parameters = if c.sig(candidate_signature).target.is_some() {
             let target = c.sig(candidate_signature).target;
             c.sig(target).type_parameters.clone()
         } else {

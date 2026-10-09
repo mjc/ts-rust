@@ -1408,7 +1408,7 @@ impl Checker {
         let target_type_parameters = if sig_target.is_some() {
             self.sig(sig_target).type_parameters.clone()
         } else {
-            Vec::new()
+            SharedList::default()
         };
         if nb_flags(b).intersects(NodeBuilderFlags::WRITE_TYPE_ARGUMENTS_OF_SIGNATURE)
             && sig_target.is_some()
@@ -1435,13 +1435,13 @@ impl Checker {
                     .check_flags
                     .intersects(CheckFlags::REST_PARAMETER)
         });
-        let source_params = if has_non_trailing_rest {
-            sig_parameters
+        let source_params: &[SymbolId] = if has_non_trailing_rest {
+            &sig_parameters
         } else {
-            expanded_params
+            &expanded_params
         };
         let mut parameters: Vec<Node> = Vec::with_capacity(source_params.len() + 1);
-        for parameter in source_params {
+        for &parameter in source_params {
             parameters.push(self.symbol_to_parameter_declaration(
                 b,
                 parameter,
@@ -1662,7 +1662,7 @@ impl Checker {
                     .collect();
             }
         }
-        vec![sig_parameters]
+        vec![sig_parameters.to_vec()]
     }
 
     // Go: checker/nodebuilderimpl.go:1989 getExpandedParameters.getUniqAssociatedNamesFromTupleType

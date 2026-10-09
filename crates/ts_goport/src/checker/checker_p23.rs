@@ -314,7 +314,7 @@ impl Checker {
                 let source = self.sig(sig).type_parameters[0];
                 self.new_simple_type_mapper(source, fresh_type_parameters[0])
             } else {
-                let sources: SharedList<TypeId> = self.sig(sig).type_parameters.as_slice().into();
+                let sources = self.sig(sig).type_parameters.clone();
                 let targets: SharedList<TypeId> = fresh_type_parameters.as_slice().into();
                 self.new_array_type_mapper_shared(sources, targets)
             };
@@ -349,9 +349,9 @@ impl Checker {
         let result = self.new_signature_owned(
             sig_flags & SignatureFlags::PROPAGATING_FLAGS,
             sig_declaration,
-            fresh_type_parameters,
+            fresh_type_parameters.into(),
             this_parameter,
-            parameters,
+            parameters.into(),
             TypeId::NIL,          /*resolvedReturnType*/
             TypePredicateId::NIL, /*resolvedTypePredicate*/
             sig_min_argument_count,
@@ -811,7 +811,7 @@ impl Checker {
                     .to_vec();
                 let origin = self.class_type_parameters_origin(class_type);
                 let s = self.sig_mut(sig);
-                s.type_parameters = local_type_parameters;
+                s.type_parameters = local_type_parameters.into();
                 s.type_parameters_origin = origin;
                 s.resolved_return_type = class_type;
                 if is_abstract {

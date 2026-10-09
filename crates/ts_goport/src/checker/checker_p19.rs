@@ -917,7 +917,7 @@ impl Checker {
                 all_type_parameters.push(this_type);
                 let d = self.ty_mut(t).as_interface_type_mut();
                 d.this_type = this_type;
-                d.all_type_parameters = all_type_parameters;
+                d.all_type_parameters = all_type_parameters.into();
                 d.outer_type_parameter_count = outer_type_parameter_count as i32;
                 d.reference.resolved_type_arguments = d.type_parameters().into();
                 let key = get_type_list_key(&d.reference.resolved_type_arguments);

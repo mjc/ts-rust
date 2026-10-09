@@ -1298,7 +1298,7 @@ impl Checker {
             if return_signature.is_some() {
                 let new_return_signature = self.clone_signature(return_signature);
                 let r = self.sig_mut(new_return_signature);
-                r.type_parameters = inferred_type_parameters.to_vec();
+                r.type_parameters = inferred_type_parameters.into();
                 r.type_parameters_origin = inferred_type_parameters_origin;
                 let new_return_type = self.get_or_create_type_from_signature(new_return_signature);
                 let instantiated_mapper = self.sig(instantiated_signature).mapper;
