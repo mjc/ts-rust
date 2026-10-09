@@ -190,9 +190,6 @@ struct FileStore {
     /// Slot of the SourceFile node that `mark_source_file_roots` found when
     /// the file was frozen, or 0 (the nil slot).
     root_slot: u32,
-    /// `file_store_parser_flags`, made on the parsing thread when the file
-    /// is frozen. The loader takes it once.
-    parser_flags: Option<Vec<NodeFlags>>,
     /// Go `file.jsdocCache`, set by `finishSourceFile`. Node reads use it
     /// until the file is published (its `GoFile` holds it then), so
     /// `publish_file_stores` empties it.
@@ -3699,22 +3696,18 @@ impl FileStore {
     /// `freeze_file_store` for this store, which has id `file`.
     fn freeze(&mut self, file: usize) {
         self.end_parse();
-        // One pass over the records for the parser flags and the facts.
-        let mut flags = Vec::with_capacity(self.records.len());
-        self.make_facts(|r| flags.push(r.flags()));
-        self.parser_flags = Some(flags);
+        self.make_facts();
     }
 
     /// Makes `facts` and the U1 (e) `bind_estimate` in one pass over the
-    /// slots, and calls `each` on every slot record. Then moves the R2-5
+    /// slots. Then moves the R2-5
     /// build vector into `links` and drops `identifier_names`.
     // PERF: no pass over the node data. Debug builds check the records and
     // kids against the node data (`debug_check_kids`).
-    fn make_facts(&mut self, mut each: impl FnMut(&NodeRecord)) {
+    fn make_facts(&mut self) {
         let mut facts = StoreFacts::ONLY_NIL_SLOT;
         let mut counts = BindCounts::default();
         for (i, (record, &kind)) in self.records.iter().zip(&self.kinds).enumerate() {
-            each(record);
             counts.add(kind);
             if i != NIL_SLOT as usize {
                 facts.add(record, kind);
@@ -3835,7 +3828,6 @@ impl FileStore {
         self.jsdoc_cache = FxHashMap::default();
         self.lazy_js_doc = None;
         self.lazy_jsdoc_cache = FxHashMap::default();
-        self.parser_flags = None;
         // lsshells M3c: the `GoFile` holds the JSDoc cache and the
         // diagnostics of the file from now on.
         if let Some(owned) = self.owned.as_deref_mut() {
@@ -3846,7 +3838,7 @@ impl FileStore {
             self.root = handle(file, self.root_slot);
         }
         if !self.facts_made {
-            self.make_facts(|_| {});
+            self.make_facts();
         }
     }
 
@@ -3919,7 +3911,7 @@ pub fn is_file_store_frozen(file: usize) -> bool {
 }
 
 /// Number of slots (nil, alias and node slots). Per-node vectors that are
-/// indexed by `NodeId::index()` (`GoFile::parser_flags`) need this length.
+/// indexed by `NodeId::index()` need this length.
 #[must_use]
 pub fn file_store_slot_count(file: usize) -> usize {
     // A freeable file version keeps its records in its node shell.
@@ -3928,21 +3920,56 @@ pub fn file_store_slot_count(file: usize) -> usize {
         .unwrap_or_else(|| with_store(file, |s| s.records.len()))
 }
 
-/// The parser `node.Flags` of every slot, indexed by slot index. Nil and
-/// alias slots give no flags. The loader fills `GoFile::parser_flags` from
-/// this for the binder, before the publish.
-#[must_use]
-pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
-    // AST node records, step 2: the records of a published file also hold
-    // the flags that the binder added, so its parser flags are the ones
-    // that its `GoFile` took before the publish.
-    if let Some(flags) = try_with_go_file(file, |g| g.parser_flags.clone()) {
-        return flags;
+/// A pinned view of the parser flags in published node records. Binder
+/// additions are masked out; no second per-node flags column is retained.
+#[derive(Clone, Default)]
+pub struct ParserFlags {
+    records: FileRef<[NodeRecord]>,
+}
+
+impl ParserFlags {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.records.len()
     }
-    let computed = |s: &FileStore| s.records.iter().map(NodeRecord::flags).collect();
-    with_store_mut(file, |s| {
-        s.parser_flags.take().unwrap_or_else(|| computed(s))
-    })
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> NodeFlags {
+        self.records[index].flags() & super::PARSER_ONLY_FLAGS
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeFlags> + '_ {
+        self.records
+            .iter()
+            .map(|r| r.flags() & super::PARSER_ONLY_FLAGS)
+    }
+}
+
+/// Parser flags of a published file. Permanent files borrow their static
+/// records; a freeable version pins its pooled records for the view's life.
+#[must_use]
+pub fn file_store_parser_flags(file: usize) -> ParserFlags {
+    let block = file_block(file).expect("parser flags need a published file");
+    let records = if block.file.store.is_some() {
+        FileRef::Static(block.records)
+    } else {
+        FileRef::Pinned {
+            version: published_version(file).expect("a published file version"),
+            key: 0,
+            get: |version, _| {
+                let published = version
+                    .published()
+                    .expect("a pinned file version is published");
+                &published.block.records[..published.go_file.node_count]
+            },
+        }
+    };
+    ParserFlags { records }
 }
 
 /// Publishes the build stores of this thread: `go_files[i]` is the
@@ -5657,7 +5684,7 @@ impl FileStore {
             text_is_keyword,
         } = slot;
         let node = match data {
-            Some(data) => leak_in_ast_arena(data),
+            Some(data) => shared_empty_node(&data).unwrap_or_else(|| leak_in_ast_arena(data)),
             None => shared_name_node(kind),
         };
         // The `ParentCode` of a parent in this store (nil for `NIL_SLOT`).
@@ -5815,7 +5842,6 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
                 local(s.root),
                 s.aliases.len(),
             ),
-            format!("parser_flags {:?}", s.parser_flags),
             format!("jsdoc {jsdoc:?}"),
             format!(
                 "lazy {:?} lazy_cache {}",
@@ -5918,6 +5944,41 @@ fn shared_name_node(kind: SyntaxKind) -> &'static NodeData {
     }
 }
 
+/// Empty payloads carry no node identity: kind, flags, location and parent
+/// live in the slot columns. Share their immutable data, as for name nodes,
+/// instead of retaining an arena entry for each token or keyword type.
+/// A data write still replaces only its slot (`replace_store_node_data`).
+#[inline]
+fn shared_empty_node(data: &NodeData) -> Option<&'static NodeData> {
+    macro_rules! shared {
+        ($variant:ident, $payload:ident, $value:expr) => {{
+            // Adding a payload field must force a new sharing audit.
+            let crate::astdata::$payload = **$value;
+            static DATA: OnceLock<NodeData> = OnceLock::new();
+            Some(DATA.get_or_init(|| NodeData::$variant(Box::new(crate::astdata::$payload))))
+        }};
+    }
+    match data {
+        NodeData::Token(value) => shared!(Token, TokenData, value),
+        NodeData::KeywordTypeNode(value) => shared!(KeywordTypeNode, KeywordTypeNodeData, value),
+        NodeData::ThisTypeNode(value) => shared!(ThisTypeNode, ThisTypeNodeData, value),
+        NodeData::NotEmittedTypeElement(value) => {
+            shared!(NotEmittedTypeElement, NotEmittedTypeElementData, value)
+        }
+        NodeData::OmittedExpression(value) => {
+            shared!(OmittedExpression, OmittedExpressionData, value)
+        }
+        NodeData::JsxOpeningFragment(value) => {
+            shared!(JsxOpeningFragment, JsxOpeningFragmentData, value)
+        }
+        NodeData::JsxClosingFragment(value) => {
+            shared!(JsxClosingFragment, JsxClosingFragmentData, value)
+        }
+        NodeData::JsDocAllType(value) => shared!(JsDocAllType, JsDocAllTypeData, value),
+        _ => None,
+    }
+}
+
 /// S1, debug builds: panics unless `data` (the payload the factory builds
 /// for a store name node of kind `kind`) equals the data of the shared node
 /// of `kind`. The struct patterns name every field, so a new astdata field
@@ -5987,6 +6048,9 @@ fn alloc_store_slot(file: usize, kind: SyntaxKind, data: NodeData, text: Option<
     );
     if FREEABLE_PARSE.get() {
         return alloc_store_owned_slot(file, kind, data, text);
+    }
+    if let Some(shared) = shared_empty_node(&data) {
+        return alloc_store_slot_node(file, kind, shared, text);
     }
     alloc_store_slot_node(file, kind, leak_in_ast_arena(data), text)
 }
@@ -6775,6 +6839,77 @@ mod tests {
     }
 
     #[test]
+    fn stateless_store_payloads_share_data_but_not_headers() {
+        fn nodes(f: &NodeFactory) -> [Node; 8] {
+            [
+                f.new_token(SyntaxKind::QuestionToken),
+                f.new_keyword_type_node(SyntaxKind::NumberKeyword),
+                f.new_this_type_node(),
+                f.new_not_emitted_type_element(),
+                f.new_omitted_expression(),
+                f.new_jsx_opening_fragment(),
+                f.new_jsx_closing_fragment(),
+                f.new_js_doc_all_type(),
+            ]
+        }
+        let file = new_file_store("/stateless.ts", "");
+        let f = NodeFactory::for_file(file);
+        let first = nodes(&f);
+        let second = nodes(&f);
+        for (&a, &b) in first.iter().zip(&second) {
+            assert_ne!(a, b);
+            assert_eq!(a.kind(), b.kind());
+            assert!(std::ptr::eq(store_ast_node(a), store_ast_node(b)));
+            set_store_node_loc(a, TextRange::new(1, 2));
+            set_store_node_parent(a, first[0]);
+            assert_ne!(a.loc(), b.loc());
+            assert_eq!(b.parent(), Node::NIL);
+        }
+        // A write replaces only its slot, as for shared name data.
+        replace_store_node_data(first[0], store_ast_node(first[0]).clone());
+        assert!(!std::ptr::eq(
+            store_ast_node(first[0]),
+            store_ast_node(second[0])
+        ));
+        freeze_file_store(file);
+        for (&a, &b) in first.iter().zip(&second) {
+            assert_eq!(a.kind(), b.kind());
+            assert_ne!(a.loc(), b.loc());
+        }
+    }
+
+    #[test]
+    fn stateless_snapshot_payloads_share_data() {
+        let file = new_file_store("/stateless-snapshot.ts", "");
+        let f = NodeFactory::for_file(file);
+        for _ in 0..2 {
+            f.new_token(SyntaxKind::QuestionToken);
+            f.new_keyword_type_node(SyntaxKind::NumberKeyword);
+        }
+        freeze_file_store(file);
+        let views = lib_parse_slot_views(file).unwrap();
+        let loaded = new_file_store("/loaded-stateless.ts", "");
+        let mut slots = views.iter().map(|v| LibParseSlot {
+            kind: v.kind,
+            flags: v.flags,
+            loc: v.loc,
+            parent: v.parent,
+            first_child: v.first_child,
+            next_sibling: v.next_sibling,
+            data: Some(v.data.clone()),
+            name: v.name.clone(),
+            text_is_keyword: v.text_is_keyword,
+        });
+        assert!(load_lib_parse_slots(loaded, views.len(), || slots.next()));
+        freeze_file_store(loaded);
+        let hydrated = lib_parse_slot_views(loaded).unwrap();
+        for (a, b) in [(0, 2), (1, 3)] {
+            assert!(std::ptr::eq(hydrated[a].data, hydrated[b].data));
+            assert!(std::ptr::eq(hydrated[a].data, views[a].data));
+        }
+    }
+
+    #[test]
     fn store_identifier_text_lives_in_the_name_column() {
         let file = new_file_store("/e.ts", "");
         let f = NodeFactory::for_file(file);
@@ -7323,6 +7458,53 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn published_parser_flags_preserve_parse_errors_and_exclude_bind_flags() {
+        let file = new_file_store("/parserflags/static.ts", "x;");
+        let x = NodeFactory::for_file(file).new_identifier("x");
+        let original = NodeFlags::AMBIENT | NodeFlags::THIS_NODE_HAS_ERROR;
+        set_store_node_flags(x, original);
+        freeze_file_store(file);
+        crate::program::publish_parsed_files("/");
+        let flags = file_store_parser_flags(file);
+        let index = slot_index(x);
+        assert_eq!(flags.len(), file_store_slot_count(file));
+        assert_eq!(flags.get(index), original);
+        let before: Vec<_> = flags.iter().collect();
+        let data = NodeBindData {
+            added_flags: NodeFlags::CONTAINS_THIS | NodeFlags::THIS_NODE_OR_ANY_SUB_NODES_HAS_ERROR,
+            ..NodeBindData::default()
+        };
+        bind_store_records(
+            file,
+            std::iter::once((index, 0, Some(&data), FlowNodeId::NIL)),
+        );
+        assert!(x.flags().contains(data.added_flags));
+        assert_eq!(flags.get(index), original);
+        assert_eq!(flags.iter().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn parser_flags_view_pins_freeable_node_records() {
+        use super::super::file_version::{FileVersion, release_file_version_pins};
+        let file = new_file_store("/parserflags/version.ts", "x;");
+        let x = NodeFactory::for_file(file).new_identifier("x");
+        set_store_node_flags(x, NodeFlags::AMBIENT);
+        freeze_file_store(file);
+        let version = FileVersion::new(file);
+        let weak = Arc::downgrade(&version);
+        crate::program::publish_parsed_files("/");
+        let flags = file_store_parser_flags(file);
+        drop(version);
+        release_file_version_pins();
+        assert!(weak.upgrade().is_some(), "the flags view pins its version");
+        assert_eq!(flags.get(slot_index(x)), NodeFlags::AMBIENT);
+        assert_eq!(flags.len(), 2);
+        drop(flags);
+        release_file_version_pins();
+        assert!(weak.upgrade().is_none(), "the flags view releases its pin");
     }
 
     // astmem1 P3: the bind ORs its added flags into the `flags` word of a

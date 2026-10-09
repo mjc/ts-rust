@@ -464,9 +464,9 @@ mod intern {
     /// 2048 names.
     const CACHE_SETS: usize = 1024;
     const CACHE_WAYS: usize = 2;
-    /// Initial capacity of each shard map (at least 32K names in all), so
-    /// interning a project rarely grows and rehashes a map under its lock.
-    const SHARD_CAPACITY: usize = 1024;
+    /// Initial capacity per shard. Bundled library names bypass these maps;
+    /// larger projects grow them normally as more names are interned.
+    const SHARD_CAPACITY: usize = 256;
 
     type Slots = Box<[OnceLock<&'static str>]>;
     static TEXTS: [OnceLock<Slots>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
@@ -994,6 +994,56 @@ mod intern {
             }
             assert_eq!(Name::from("notALibName_u6").stable_id(), None);
             assert!(Name::from_stable_id(u32::MAX).is_none());
+        }
+
+        #[test]
+        fn dynamic_names_survive_shard_growth() {
+            let target = 0;
+            let (capacity, mut hashes) = {
+                let shard = shards()[target]
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                (
+                    shard.ids.capacity(),
+                    shard
+                        .ids
+                        .keys()
+                        .copied()
+                        .collect::<rustc_hash::FxHashSet<_>>(),
+                )
+            };
+            let mut names = Vec::with_capacity(capacity + 1);
+            for i in 0.. {
+                let text = format!("interner_shard_growth_{i}");
+                let hash = hash_str(&text);
+                if shard_index(hash) != target || !hashes.insert(hash) {
+                    continue;
+                }
+                let (id, _) = intern_shared(&text, hash);
+                names.push((text, hash, Name(id)));
+                if names.len() > capacity {
+                    break;
+                }
+            }
+            assert!(
+                shards()[target]
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .ids
+                    .capacity()
+                    > capacity
+            );
+            for (text, hash, name) in names {
+                // Bypass the thread-local cache to check the rehashed map.
+                let (id, stored) = intern_shared(&text, hash);
+                assert_eq!(Name(id), name);
+                assert_eq!(stored, text);
+                assert_eq!(name.as_str(), text);
+                assert_eq!(name.table_hash(), super::super::table_hash(&text));
+                assert_eq!(Name::from(text.as_str()), name);
+            }
         }
     }
 }
@@ -4314,9 +4364,8 @@ pub(crate) fn go_panic_text(f: impl FnOnce()) -> String {
 pub struct GoFile {
     /// The `SourceFile` node. Its nodes live in a node store (`ast::store`).
     pub root: Node,
-    /// Go `node.Flags` from the parser for each node, indexed by
-    /// `NodeId::index()`. It includes the Go parser context flags.
-    pub parser_flags: Vec<NodeFlags>,
+    /// Number of node-store slots, including nil and alias slots.
+    pub node_count: usize,
     /// Go `ast.SourceFile` fields that the parser and program set.
     pub info: crate::program::SourceFileInfo,
     /// The binder fields of the nodes that are not in their node records

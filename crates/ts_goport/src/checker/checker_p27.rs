@@ -1148,7 +1148,7 @@ impl Checker {
         let key = get_type_list_key(&tps);
         let d = self.ty_mut(t).as_tuple_type_mut();
         d.interface.this_type = this_type;
-        d.interface.all_type_parameters = all_type_parameters;
+        d.interface.all_type_parameters = all_type_parameters.into();
         let mut instantiations = InstantiationMap::default();
         instantiations.insert(key, t);
         d.interface.instantiations = Some(instantiations);

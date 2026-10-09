@@ -429,24 +429,23 @@ impl Checker {
         self.new_signature_owned(
             flags,
             declaration,
-            type_parameters.to_vec(),
+            type_parameters.into(),
             this_parameter,
-            parameters.to_vec(),
+            parameters.into(),
             resolved_return_type,
             resolved_type_predicate,
             min_argument_count,
         )
     }
 
-    /// `new_signature` for a caller that owns the lists, so the signature
-    /// takes them without a copy.
+    /// `new_signature` for a caller that owns the parameter lists.
     pub fn new_signature_owned(
         &mut self,
         flags: SignatureFlags,
         declaration: Node,
-        type_parameters: Vec<TypeId>,
+        type_parameters: SharedList<TypeId>,
         this_parameter: SymbolId,
-        parameters: Vec<SymbolId>,
+        parameters: SharedList<SymbolId>,
         resolved_return_type: TypeId,
         resolved_type_predicate: TypePredicateId,
         min_argument_count: i32,

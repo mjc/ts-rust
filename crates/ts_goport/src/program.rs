@@ -2194,7 +2194,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
     // largest file (lib.dom) starts at once and the small files fill the other
     // threads while it binds. The join order stays the file order.
     let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(files[i].0.go_file().parser_flags.len()));
+    order.sort_by_key(|&i| std::cmp::Reverse(files[i].0.go_file().node_count));
     let queue = BindQueue::new(
         files.iter().map(|&(_, freeable)| freeable).collect(),
         lineage.symbols.next_file_offsets(),

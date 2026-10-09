@@ -1431,18 +1431,20 @@ impl<'a> ExistingNodeTreeVisitor<'a> {
         let introduces_new_scope = is_function_like(node) || is_mapped_type_node(node);
         let mut exit = None;
         if introduces_new_scope {
-            let mut params: Vec<SymbolId> = Vec::new();
-            let mut type_params: Vec<TypeId> = Vec::new();
+            let mut params: SharedList<SymbolId> = SharedList::default();
+            let mut type_params: SharedList<TypeId> = SharedList::default();
             if is_function_like(node) {
                 let sig = self.ctx.c.get_signature_from_declaration(node);
                 params = self.ctx.c.sig(sig).parameters.clone();
                 type_params = self.ctx.c.sig(sig).type_parameters.clone();
             } else if is_conditional_type_node(node) {
                 // !!! TODO: impossible in combination with the scope start check???
-                type_params = self.ctx.c.get_infer_type_parameters(node);
+                type_params = self.ctx.c.get_infer_type_parameters(node).into();
             } else if is_mapped_type_node(node) {
                 let tp_symbol = self.ctx.c.get_symbol_of_declaration(node.type_parameter());
-                type_params = vec![self.ctx.c.get_declared_type_of_type_parameter(tp_symbol)];
+                type_params = [self.ctx.c.get_declared_type_of_type_parameter(tp_symbol)]
+                    .as_slice()
+                    .into();
             }
             // PORT: Go passes nil for originalParameters and mapper.
             exit = Some(self.ctx.c.enter_new_scope(
